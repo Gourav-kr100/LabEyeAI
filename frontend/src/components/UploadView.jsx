@@ -17,6 +17,18 @@ export default function UploadView() {
   const fileInputRef = useRef(null);
   const toast = useToast();
 
+  const parseJsonSafely = async (response) => {
+    const text = await response.text();
+    try {
+      return JSON.parse(text);
+    } catch (error) {
+      if (text.trim().startsWith('<')) {
+        throw new Error(`Server returned HTML (Backend might not be running or crashed): ${response.status} ${response.statusText}`);
+      }
+      throw new Error(`Invalid server response (${response.status}): ${text.slice(0, 200)}`);
+    }
+  };
+
   const handleDragOver = (e) => { e.preventDefault(); setIsDragging(true); };
   const handleDragLeave = (e) => { e.preventDefault(); setIsDragging(false); };
   const handleDrop = (e) => {
@@ -83,7 +95,7 @@ export default function UploadView() {
 
       await animateProgress(0, 40, 1500);
       const uploadRes = await fetch('/api/upload', { method: 'POST', body: fd });
-      const uploadJson = await uploadRes.json();
+      const uploadJson = await parseJsonSafely(uploadRes);
       
       if (!uploadRes.ok || !uploadJson.success) throw new Error(uploadJson.detail || 'Upload failed');
 
@@ -92,7 +104,7 @@ export default function UploadView() {
       await animateProgress(40, 90, 5000);
 
       const analyzeRes = await fetch(`/api/analyze/${analysisId}`, { method: 'POST' });
-      const analyzeJson = await analyzeRes.json();
+      const analyzeJson = await parseJsonSafely(analyzeRes);
       
       if (!analyzeRes.ok || !analyzeJson.success) throw new Error(analyzeJson.detail || 'Analysis failed');
 
@@ -114,8 +126,8 @@ export default function UploadView() {
   return (
     <div className="upload-section animate-fade-in">
       <div className="section-header">
-        <h1 className="gradient-text-animate">AI Chair Arrangement Analysis</h1>
-        <p>Upload a lab or classroom photo to instantly detect chair arrangements</p>
+        <h1 className="gradient-text-animate">Chair Arrangement Detection</h1>
+        <p>Upload a lab or classroom photo to instantly detect chair arrangements using a local ML model</p>
       </div>
 
       <div className="upload-grid">
@@ -194,7 +206,7 @@ export default function UploadView() {
               <X size={16} /> Clear
             </button>
             <button className="btn btn-primary" onClick={handleAnalyze} disabled={!file || status === 'uploading' || status === 'analyzing'}>
-              <Play size={16} fill="currentColor" /> Analyze with AI
+              <Play size={16} fill="currentColor" /> Analyze with ML Model
             </button>
           </div>
 
@@ -204,7 +216,7 @@ export default function UploadView() {
                 <div className="progress-fill" style={{ width: `${progress}%` }}></div>
               </div>
               <p className="progress-text">
-                {status === 'uploading' ? 'Uploading image...' : 'Running AI analysis...'} {Math.round(progress)}%
+                {status === 'uploading' ? 'Uploading image...' : 'Running ML model analysis...'} {Math.round(progress)}%
               </p>
             </div>
           )}
@@ -242,7 +254,7 @@ export default function UploadView() {
 
               <div className="confidence-section">
                 <div className="confidence-header">
-                  <span>AI Confidence</span>
+                  <span>ML Confidence</span>
                   <span className="confidence-value">{result.avg_confidence}%</span>
                 </div>
                 <div className="confidence-bar">
@@ -263,7 +275,7 @@ export default function UploadView() {
 
             {result.ai_description && (
               <div className="chair-details" style={{ marginTop: '16px' }}>
-                <h3>🤖 AI Analysis Summary</h3>
+                <h3>🤖 ML Model Summary</h3>
                 <div style={{ padding: '14px 16px', background: 'var(--bg-main)', borderRadius: '8px', lineHeight: '1.6', color: 'var(--text-primary)', fontSize: '14px' }}>
                   {result.ai_description}
                 </div>

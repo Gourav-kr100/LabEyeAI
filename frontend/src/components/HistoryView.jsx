@@ -1,11 +1,13 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Filter, FileText, Trash2 } from 'lucide-react';
+import { Filter, FileText, Trash2, Eye, X, AlertTriangle, Check, Image as ImageIcon } from 'lucide-react';
 import { useToast } from './Toast';
 
 export default function HistoryView() {
   const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(false);
   const [filters, setFilters] = useState({ search: '', status: '', lab_room: '', date_from: '' });
+  const [selectedItem, setSelectedItem] = useState(null);
+  const [activeImageTab, setActiveImageTab] = useState('annotated');
   const toast = useToast();
 
   const fetchHistory = useCallback(async () => {
@@ -157,6 +159,17 @@ export default function HistoryView() {
                       <td><span className={`status-badge ${statusCls}`}>{a.status}</span></td>
                       <td>
                         <div className="history-actions">
+                          <button
+                            className="btn btn-secondary btn-sm"
+                            onClick={() => {
+                              setSelectedItem(a);
+                              setActiveImageTab('annotated');
+                            }}
+                            type="button"
+                            style={{ padding: '4px 10px', fontSize: '12px' }}
+                          >
+                            <Eye size={12} /> View
+                          </button>
                           {a.pdf_report_url ? (
                             <a href={a.pdf_report_url} target="_blank" rel="noreferrer" className="btn btn-secondary btn-sm" style={{ padding: '4px 10px', fontSize: '12px', textDecoration: 'none' }}>
                               <FileText size={12} /> PDF
@@ -166,6 +179,7 @@ export default function HistoryView() {
                             className="btn btn-danger btn-sm"
                             onClick={() => handleDelete(a.id)}
                             type="button"
+                            style={{ padding: '4px 10px', fontSize: '12px' }}
                           >
                             <Trash2 size={12} /> Delete
                           </button>
@@ -181,6 +195,140 @@ export default function HistoryView() {
           </table>
         </div>
       </div>
+
+      {/* Detail Modal */}
+      {selectedItem && (
+        <div className="modal-overlay" onClick={() => setSelectedItem(null)}>
+          <div className="modal-content" onClick={e => e.stopPropagation()}>
+            <div className="card-header" style={{ padding: '16px 24px' }}>
+              <div>
+                <h2 style={{ fontSize: '18px', fontWeight: '700' }}>
+                  🔍 Analysis Details
+                </h2>
+                <p style={{ fontSize: '12px', color: 'var(--text-secondary)', marginTop: '2px' }}>
+                  {selectedItem.original_filename} — {new Date(selectedItem.created_at).toLocaleString()}
+                </p>
+              </div>
+              <button 
+                className="theme-toggle" 
+                onClick={() => setSelectedItem(null)}
+                style={{ width: '32px', height: '32px' }}
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            <div className="modal-body">
+              <div className="result-summary" style={{ paddingTop: '16px' }}>
+                <div className="stat-grid" style={{ padding: '0 24px 16px' }}>
+                  <div className="stat-item">
+                    <span className="stat-value">{selectedItem.total_chairs}</span>
+                    <span className="stat-label">Total Chairs</span>
+                  </div>
+                  <div className="stat-item stat-success">
+                    <span className="stat-value">{selectedItem.correct_chairs}</span>
+                    <span className="stat-label">Properly Arranged</span>
+                  </div>
+                  <div className="stat-item stat-danger">
+                    <span className="stat-value">{selectedItem.misplaced_chairs}</span>
+                    <span className="stat-label">Misplaced</span>
+                  </div>
+                  <div className="stat-item">
+                    <span className="stat-value">{selectedItem.accuracy}%</span>
+                    <span className="stat-label">Accuracy</span>
+                  </div>
+                </div>
+
+                <div className="confidence-section">
+                  <div className="confidence-header">
+                    <span>ML Confidence</span>
+                    <span className="confidence-value">{selectedItem.avg_confidence}%</span>
+                  </div>
+                  <div className="confidence-bar">
+                    <div className="confidence-fill" style={{ width: `${selectedItem.avg_confidence}%` }}></div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="image-tabs" style={{ marginTop: '8px' }}>
+                <button className={`image-tab ${activeImageTab === 'annotated' ? 'active' : ''}`} onClick={() => setActiveImageTab('annotated')}>Annotated</button>
+                <button className={`image-tab ${activeImageTab === 'original' ? 'active' : ''}`} onClick={() => setActiveImageTab('original')}>Original</button>
+              </div>
+              
+              <div className="result-image-container" style={{ margin: '0 24px 16px' }}>
+                {activeImageTab === 'annotated' && selectedItem.result_image_url && (
+                  <img src={selectedItem.result_image_url} alt="Annotated" className="result-image" />
+                )}
+                {activeImageTab === 'original' && selectedItem.upload_image_url && (
+                  <img src={selectedItem.upload_image_url} alt="Original" className="result-image" />
+                )}
+                {((activeImageTab === 'annotated' && !selectedItem.result_image_url) || 
+                  (activeImageTab === 'original' && !selectedItem.upload_image_url)) && (
+                  <div style={{ color: 'var(--text-muted)', fontStyle: 'italic' }}>Image not available</div>
+                )}
+              </div>
+
+              {selectedItem.ai_description && (
+                <div className="chair-details" style={{ paddingTop: '0', paddingBottom: '16px' }}>
+                  <h3>🤖 ML Model Summary</h3>
+                  <div style={{ padding: '14px 16px', background: 'var(--bg-input)', borderRadius: '8px', lineHeight: '1.6', color: 'var(--text-primary)', fontSize: '14px' }}>
+                    {selectedItem.ai_description}
+                  </div>
+                </div>
+              )}
+
+              <div className="chair-details" style={{ paddingTop: '0' }}>
+                <h3>🚨 Misplaced Chairs Breakdown</h3>
+                <div className="chair-list">
+                  {(() => {
+                    const misplaced = (selectedItem.details?.chairs || []).filter(c => !c.is_properly_arranged);
+                    if (misplaced.length > 0) {
+                      return misplaced.map((c, idx) => (
+                        <div key={idx} className="chair-item misplaced">
+                          <span className="chair-icon"><AlertTriangle size={20} color="var(--danger)" /></span>
+                          <div className="chair-info">
+                            <div className="chair-name">Chair #{c.chair_id}</div>
+                            <div className="chair-status">{(c.issues || []).join(', ') || 'Misplaced'}</div>
+                          </div>
+                          <span className="chair-score bad">
+                            {Math.round(c.alignment_score)}%
+                          </span>
+                        </div>
+                      ));
+                    } else {
+                      return (
+                        <div className="chair-item" style={{ borderLeft: '4px solid var(--success)', padding: '15px' }}>
+                          <span className="chair-icon"><Check size={20} color="var(--success)" /></span>
+                          <div className="chair-info">
+                            <div className="chair-name" style={{ color: 'var(--success)', fontWeight: 'bold' }}>All Clear!</div>
+                            <div className="chair-status">Every chair is properly tucked in and positioned.</div>
+                          </div>
+                        </div>
+                      );
+                    }
+                  })()}
+                </div>
+              </div>
+            </div>
+
+            <div className="modal-footer">
+              {selectedItem.pdf_report_url && (
+                <a href={selectedItem.pdf_report_url} target="_blank" rel="noreferrer" className="btn btn-primary btn-sm" style={{ textDecoration: 'none' }}>
+                  <FileText size={14} /> PDF Report
+                </a>
+              )}
+              {selectedItem.result_image_url && (
+                <a href={selectedItem.result_image_url} download="analysis_result.jpg" className="btn btn-secondary btn-sm" style={{ textDecoration: 'none' }}>
+                  <ImageIcon size={14} /> Download Image
+                </a>
+              )}
+              <button className="btn btn-secondary btn-sm" onClick={() => setSelectedItem(null)}>
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

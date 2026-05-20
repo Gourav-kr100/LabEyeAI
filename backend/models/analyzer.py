@@ -1,35 +1,22 @@
 """
-AI Chair Detection & Alignment Analysis Engine.
-Uses Groq (Llama 4 Scout Vision) to analyze chair arrangement in lab environments.
-Sends the photo to Groq and displays the AI's analysis result directly.
+ML Chair Detection & Alignment Analysis Engine.
+Uses a local YOLO model to analyze chair arrangement in lab environments.
 """
 
 import cv2
 import numpy as np
-import base64
-import json
 import logging
 import os
-from time import perf_counter
+import json
+import pickle
 from typing import List, Dict, Any, Tuple, Optional
 from dataclasses import dataclass, field, asdict
 from types import SimpleNamespace
 
 logger = logging.getLogger("backend.analyzer")
 
-try:
-    from groq import Groq
-    GROQ_AVAILABLE = True
-except ImportError:
-    Groq = None
-    GROQ_AVAILABLE = False
-
-try:
-    from huggingface_hub import InferenceClient
-    HF_AVAILABLE = True
-except ImportError:
-    InferenceClient = None
-    HF_AVAILABLE = False
+TRAINED_PROFILE_PATH = os.path.join(os.path.dirname(__file__), "trained_profile.json")
+SVM_MODEL_PATH = os.path.join(os.path.dirname(__file__), "scene_classifier.pkl")
 
 
 @dataclass
@@ -68,39 +55,31 @@ class AnalysisResult:
 
 class ChairAnalyzer:
     """
-    AI-powered chair arrangement analyzer using Groq Vision API.
-    Uses meta-llama/llama-4-scout-17b-16e-instruct for fast, accurate vision.
+    Local-only chair arrangement analyzer using a YOLO model.
+    No external LLM or cloud vision API is required.
     """
 
     def __init__(self):
-        self.provider = os.environ.get("AI_PROVIDER", "auto").strip().lower()
-        self.groq_api_key = os.environ.get("GROQ_API_KEY")
-        self.hf_token = os.environ.get("HF_TOKEN")
-        self.hf_model_name = os.environ.get("HF_MODEL", "zai-org/GLM-OCR")
-        self.groq_model_name = "meta-llama/llama-4-scout-17b-16e-instruct"
-        self.model_name = self.hf_model_name if self.provider in ("huggingface", "auto") else self.groq_model_name
-        self.client = None
-        self.hf_client = None
+        self.provider = "local"
+        self.local_model_path = self._find_local_model_path()
+        self.model_name = "local_yolo"
         self.is_ready_flag = False
+        self.trained_profile = self._load_trained_profile()
+        self.svm_model = self._load_svm_model()
 
-        if self.provider in ("huggingface", "auto"):
-            if not self.hf_token:
-                logger.warning("⚠️ HF_TOKEN not set. Hugging Face API calls will fail.")
-            elif not HF_AVAILABLE:
-                logger.warning("⚠️ huggingface_hub package not installed.")
-            else:
-                self.is_ready_flag = True
-                logger.info("✅ Hugging Face Inference configured (%s)", self.hf_model_name)
+        if self.local_model_path:
+            self.is_ready_flag = True
+            logger.info("✅ Local YOLO model available: %s", os.path.basename(self.local_model_path))
+        else:
+            logger.warning("⚠️ Local YOLO model not found. Detection will not work.")
 
-        if self.provider in ("groq", "auto"):
-            if not self.groq_api_key:
-                logger.warning("⚠️ GROQ_API_KEY not set. Groq API calls will fail.")
-            elif not GROQ_AVAILABLE:
-                logger.warning("⚠️ groq package not installed.")
-            else:
-                self.client = Groq(api_key=self.groq_api_key)
-                self.is_ready_flag = True
-                logger.info("✅ Groq API Client initialized (%s)", self.groq_model_name)
+        if self.trained_profile:
+            logger.info("✅ Trained profile loaded: %s", TRAINED_PROFILE_PATH)
+        else:
+            logger.warning("⚠️ Trained profile not found or invalid. Using heuristic flags only.")
+
+        if self.svm_model:
+            logger.info("✅ SVM scene classifier loaded: %s", SVM_MODEL_PATH)
 
         # YOLO model (lazy-loaded)
         self._yolo_model = None
@@ -115,31 +94,16 @@ class ChairAnalyzer:
         return self.is_ready_flag
 
     def detect_objects(self, image: np.ndarray) -> List[Any]:
-        """Lightweight fallback object detector stub.
+        """Lightweight object detector that uses Ultralyics YOLO.
 
         Returns an empty list when no detector is configured. This keeps
-        the analyzer usable in environments without Groq or a local detector.
+        the analyzer usable in environments without a local detector.
         """
         # Prefer ultralytics YOLO if available and a model file exists.
-        if self._YOLO_CLASS is None:
+        if self._YOLO_CLASS is None or not self.local_model_path:
             return []
 
-        # Find model path candidates relative to this file and workspace root
-        candidates = [
-            os.path.join(os.path.dirname(__file__), '..', 'yolov8n.pt'),
-            os.path.join(os.path.dirname(__file__), '..', '..', 'yolov8n.pt'),
-            os.path.join(os.getcwd(), 'backend', 'yolov8n.pt'),
-            os.path.join(os.getcwd(), 'yolov8n.pt'),
-        ]
-        model_path = None
-        for p in candidates:
-            p = os.path.normpath(p)
-            if os.path.exists(p):
-                model_path = p
-                break
-
-        if model_path is None:
-            return []
+        model_path = self.local_model_path
 
         # Lazy load model
         if self._yolo_model is None:
@@ -150,7 +114,7 @@ class ChairAnalyzer:
 
         # Run inference
         try:
-            results = self._yolo_model.predict(source=image, verbose=False)
+            results = self._yolo_model.predict(source=image, conf=0.15, verbose=False)
         except TypeError:
             # older API fallback
             results = self._yolo_model(image)
@@ -202,282 +166,428 @@ class ChairAnalyzer:
 
         return detections
 
-    def _estimate_tilt_angle(self, obj: Any) -> float:
-        """Estimate chair tilt angle. Stub returns 0.0 for compatibility."""
-        return 0.0
+    def _find_local_model_path(self) -> Optional[str]:
+        candidates = [
+            os.path.join(os.path.dirname(__file__), '..', 'yolov8n.pt'),
+            os.path.join(os.path.dirname(__file__), '..', '..', 'yolov8n.pt'),
+            os.path.join(os.getcwd(), 'backend', 'yolov8n.pt'),
+            os.path.join(os.getcwd(), 'yolov8n.pt'),
+        ]
+        for p in candidates:
+            p = os.path.normpath(p)
+            if os.path.exists(p):
+                return p
+        return None
 
-    def _is_chair_pulled_out_of_row(self, obj: Any, chairs: List[Any]) -> bool:
-        """Determine if a chair is pulled out. Stub returns False for compatibility."""
-        return False
+    def _load_trained_profile(self) -> Optional[Dict[str, Any]]:
+        if not os.path.exists(TRAINED_PROFILE_PATH):
+            return None
 
-    def _call_groq(self, image: np.ndarray) -> dict:
-        """Sends image to Groq Vision API and returns structured JSON."""
-        if not self.client:
-            raise RuntimeError("Groq Client not initialized. Check GROQ_API_KEY.")
-
-        h, w = image.shape[:2]
-
-        # Encode image to base64 JPEG
-        success, encoded = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        if not success:
-            raise ValueError("Could not encode image.")
-        b64_image = base64.b64encode(encoded.tobytes()).decode('utf-8')
-
-        prompt = (
-            "You are a lab chair monitoring AI. Look at this photo of a computer lab.\n\n"
-            "The lab has computer desks arranged in rows. Each row has 7 chairs.\n"
-            "There may be 1 row (7 chairs) or 2 rows (14 chairs) visible.\n\n"
-            "Analyze the image and tell me:\n"
-            "1. How many total chairs are visible?\n"
-            "2. How many are MISPLACED (pulled out from desk, rotated, in the aisle)?\n"
-            "3. For each misplaced chair, describe its position and what's wrong.\n\n"
-            "A chair is PROPERLY POSITIONED if it is tucked under the desk close to the partition.\n"
-            "A chair is MISPLACED if it is pulled out into the aisle, rotated sideways, or far from the desk.\n\n"
-            "Be thorough — check EVERY chair carefully.\n\n"
-            "Return ONLY valid JSON matching this exact schema:\n"
-            "{\n"
-            '  "total_chairs": 14,\n'
-            '  "rows_visible": 2,\n'
-            '  "misplaced_chairs": [\n'
-            '    {"chair_number": 3, "position": "left row, 3rd from front", "issue": "pulled out into aisle"},\n'
-            '    {"chair_number": 5, "position": "right row, 2nd from front", "issue": "rotated sideways"}\n'
-            '  ],\n'
-            '  "properly_placed_count": 12,\n'
-            '  "summary": "2 out of 14 chairs are misplaced. Chair 3 is pulled into the aisle. Chair 5 is rotated."\n'
-            "}"
-        )
-
-        start_time = perf_counter()
         try:
-            response = self.client.chat.completions.create(
-                model=self.groq_model_name,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{b64_image}",
-                                },
-                            },
-                            {
-                                "type": "text",
-                                "text": prompt,
-                            },
-                        ],
-                    }
-                ],
-                temperature=0.0,
-                max_tokens=2048,
-                response_format={"type": "json_object"},
-            )
+            with open(TRAINED_PROFILE_PATH, 'r', encoding='utf-8') as f:
+                profile = json.load(f)
+            return profile
+        except Exception as exc:
+            logger.warning("Failed to load trained profile: %s", exc)
+            return None
 
-            raw = response.choices[0].message.content
-            duration_ms = (perf_counter() - start_time) * 1000.0
+    def _load_svm_model(self):
+        """Load the trained SVM classifier from pickle file."""
+        if not os.path.exists(SVM_MODEL_PATH):
+            return None
+        try:
+            with open(SVM_MODEL_PATH, 'rb') as f:
+                model = pickle.load(f)
+            return model
+        except Exception as exc:
+            logger.warning("Failed to load SVM model: %s", exc)
+            return None
+
+    def _normalize_features(self, features: Dict[str, float]) -> np.ndarray:
+        if not self.trained_profile:
+            return np.array([])
+
+        keys = self.trained_profile.get('feature_keys', [])
+        mean = np.array(self.trained_profile.get('normalization', {}).get('mean', []), dtype=float)
+        std = np.array(self.trained_profile.get('normalization', {}).get('std', []), dtype=float)
+        values = np.array([features.get(k, 0.0) for k in keys], dtype=float)
+        if len(values) != len(mean) or len(values) != len(std):
+            return values
+
+        return (values - mean) / (std + 1e-8)
+
+    def _classify_scene(self, features: Dict[str, float]) -> Tuple[str, float]:
+        import math
+
+        # Sanitize features
+        safe_features = {}
+        for k, v in features.items():
+            if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                safe_features[k] = 0.0
+            else:
+                safe_features[k] = float(v)
+
+        # Try SVM model first (more accurate)
+        if self.svm_model is not None and self.trained_profile:
             try:
-                groq_response = json.loads(raw)
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse Groq JSON response: {e}. Raw response: {raw[:500]}")
-                raise RuntimeError(f"Groq API returned invalid JSON: {str(e)}")
+                keys = self.trained_profile.get('feature_keys', [])
+                x = np.array([[safe_features.get(k, 0.0) for k in keys]])
 
-            logger.info(
-                "Groq API response: model=%s duration_ms=%.1f total_chairs=%s misplaced=%s proper_count=%s",
-                self.model_name,
-                duration_ms,
-                groq_response.get("total_chairs"),
-                len(groq_response.get("misplaced_chairs", [])) if isinstance(groq_response.get("misplaced_chairs"), list) else groq_response.get("misplaced_chairs"),
-                groq_response.get("properly_placed_count"),
-            )
-            logger.debug("Groq raw response: %s", raw)
-            return groq_response
+                prediction = self.svm_model.predict(x)[0]
 
-        except Exception as e:
-            logger.exception("Groq API Error")
-            error_msg = str(e).lower()
-            if "invalid api key" in error_msg or "authentication" in error_msg:
-                raise RuntimeError("INVALID_API_KEY")
-            if "rate limit" in error_msg or "quota" in error_msg or "429" in error_msg:
-                raise RuntimeError("QUOTA_EXHAUSTED")
-            raise RuntimeError(f"Groq API failed: {str(e)}")
+                if hasattr(self.svm_model, 'predict_proba'):
+                    probabilities = self.svm_model.predict_proba(x)[0]
+                    confidence = float(max(probabilities)) * 100.0
+                else:
+                    confidence = 75.0
 
-    def _call_hf(self, image: np.ndarray) -> str:
-        """Sends image to Hugging Face Inference API and returns raw text."""
-        if not self.hf_token:
-            raise RuntimeError("HF_TOKEN_MISSING")
-        if not HF_AVAILABLE or InferenceClient is None:
-            raise RuntimeError("HUGGINGFACE_HUB_NOT_INSTALLED")
+                scene = "misplaced_arrangement" if prediction == 1 else "correct_arrangement"
+                return scene, confidence
+            except Exception as e:
+                logger.warning("SVM classification failed, falling back to centroid: %s", e)
 
-        if self.hf_client is None:
-            self.hf_client = InferenceClient(token=self.hf_token)
+        # Fall back to centroid-based classifier
+        if not self.trained_profile:
+            return "local_fallback", 0.0
 
-        success, encoded = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        if not success:
-            raise ValueError("Could not encode image for Hugging Face Inference.")
-        image_bytes = encoded.tobytes()
+        x_norm = self._normalize_features(safe_features)
+        if x_norm.size == 0:
+            return "local_fallback", 0.0
 
-        start_time = perf_counter()
+        x_norm = np.nan_to_num(x_norm, nan=0.0, posinf=0.0, neginf=0.0)
+
+        classifier = self.trained_profile.get('classifier', {})
+        direction = np.array(classifier.get('decision_direction', []), dtype=float)
+        boundary = np.array(classifier.get('decision_boundary', []), dtype=float)
+        if direction.size != x_norm.size or boundary.size != x_norm.size:
+            return "local_fallback", 0.0
+
+        score = float(np.dot(x_norm - boundary, direction))
+        if math.isnan(score) or math.isinf(score):
+            score = 0.0
+
+        scene = "misplaced_arrangement" if score > 0 else "correct_arrangement"
+        confidence = min(max((score + 1.0) / 2.0, 0.0), 1.0)
+        if math.isnan(confidence) or math.isinf(confidence):
+            confidence = 0.0
+        return scene, confidence * 100.0
+
+    def _safe_float(self, v: Any, default: float = 0.0) -> float:
         try:
-            raw_text = self.hf_client.image_to_text(image_bytes, model=self.hf_model_name)
-        except Exception as e:
-            logger.exception("Hugging Face Inference error")
-            error_msg = str(e).lower()
-            if "invalid" in error_msg or "authentication" in error_msg:
-                raise RuntimeError("INVALID_API_KEY")
-            if "rate limit" in error_msg or "quota" in error_msg or "429" in error_msg:
-                raise RuntimeError("QUOTA_EXHAUSTED")
-            raise RuntimeError(f"Hugging Face Inference failed: {str(e)}")
+            f = float(v)
+        except Exception:
+            return default
+        if np.isnan(f) or np.isinf(f):
+            return default
+        return f
 
-        duration_ms = (perf_counter() - start_time) * 1000.0
-        logger.info(
-            "Hugging Face response: model=%s duration_ms=%.1f output_len=%d",
-            self.hf_model_name,
-            duration_ms,
-            len(raw_text) if raw_text is not None else 0,
-        )
-        logger.debug("Hugging Face raw text: %s", raw_text)
-        return raw_text if raw_text is not None else ""
+    def _find_nearest_desk(self, chair: Any, desks: List[Any]) -> Tuple[Optional[Any], float, float]:
+        best_desk = None
+        best_dist = float('inf')
+        best_overlap = 0.0
+        x1, y1, x2, y2 = chair.bbox
+        chair_area = max(1, (x2 - x1) * (y2 - y1))
 
-    def analyze_arrangement(self, image: np.ndarray) -> AnalysisResult:
-        """Full analysis pipeline using Groq or Hugging Face Vision API."""
-        h, w = image.shape[:2]
+        for desk in desks:
+            dx1, dy1, dx2, dy2 = desk.bbox
+            ix1 = max(x1, dx1)
+            iy1 = max(y1, dy1)
+            ix2 = min(x2, dx2)
+            iy2 = min(y2, dy2)
+            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            union = chair_area + max(1, (dx2 - dx1) * (dy2 - dy1)) - inter
+            overlap_ratio = inter / max(union, 1)
+            center_dist = np.sqrt((chair.center[0] - desk.center[0])**2 + (chair.center[1] - desk.center[1])**2)
+            if overlap_ratio > best_overlap or (overlap_ratio == best_overlap and center_dist < best_dist):
+                best_overlap = overlap_ratio
+                best_dist = center_dist
+                best_desk = desk
 
-        used_provider = self.provider
-        try:
-            if self.provider in ("huggingface", "auto"):
-                try:
-                    raw_text = self._call_hf(image)
-                    detected_chairs = [o for o in self.detect_objects(image) if getattr(o, "class_id", None) == 56]
-                    total_chairs = len(detected_chairs)
-                    groq_response = {
-                        "total_chairs": total_chairs,
-                        "rows_visible": 0,
-                        "misplaced_chairs": [],
-                        "properly_placed_count": total_chairs,
-                        "summary": raw_text,
-                    }
-                    scene_class = "huggingface_image_to_text"
-                    scene_confidence = 50.0
-                    used_provider = "huggingface"
-                except RuntimeError as hf_err:
-                    if self.provider == "huggingface":
-                        raise
-                    logger.warning("Hugging Face failed, falling back to Groq: %s", hf_err)
-                    groq_response = self._call_groq(image)
-                    scene_class = "groq_analyzed"
-                    scene_confidence = 90.0
-                    used_provider = "groq"
-            else:
-                groq_response = self._call_groq(image)
-                scene_class = "groq_analyzed"
-                scene_confidence = 90.0
-                used_provider = "groq"
-        except RuntimeError as e:
-            err = str(e)
-            if err == "INVALID_API_KEY":
-                scene_class = "invalid_api_key"
-            elif err == "QUOTA_EXHAUSTED":
-                scene_class = "quota_exhausted"
-            else:
-                scene_class = "error"
-            logger.warning("Analysis error: %s", e)
-            return AnalysisResult(
-                total_chairs=0, total_desks=0, correct_chairs=0, misplaced_chairs=0,
-                accuracy=0.0, avg_confidence=0.0, chairs=[], desks=[],
-                image_width=w, image_height=h, scene_classification=scene_class,
-                ai_provider=used_provider,
-                ai_model=self.hf_model_name if used_provider == "huggingface" else self.groq_model_name
-            )
+        return best_desk, best_dist, best_overlap
 
-        # Parse response
-        total_chairs = groq_response.get("total_chairs", 0)
-        misplaced_list = groq_response.get("misplaced_chairs", [])
-        # Handle case where misplaced_chairs might be an int instead of list
-        if isinstance(misplaced_list, int):
-            misplaced_count = misplaced_list
-            misplaced_list = []
-        else:
-            misplaced_count = len(misplaced_list)
-        
-        properly_placed = groq_response.get("properly_placed_count", total_chairs - misplaced_count)
-        summary = groq_response.get("summary", "")
-        rows_visible = groq_response.get("rows_visible", 1)
+    def has_local_fallback(self) -> bool:
+        return self._YOLO_CLASS is not None and self._find_local_model_path() is not None
 
-        logger.info(
-            "AnalysisResult details: provider=%s model=%s total_chairs=%d misplaced=%d accuracy=%.1f scene=%s summary_snippet=%s",
-            used_provider,
-            self.model_name,
-            total_chairs,
-            misplaced_count,
-            (properly_placed / max(total_chairs, 1)) * 100.0,
-            scene_class,
-            repr(summary[:180].replace("\n", " "))
-        )
+    def _local_fallback_analysis(self, image: np.ndarray) -> AnalysisResult:
+        objects = self.detect_objects(image)
+        chairs_raw = [o for o in objects if getattr(o, 'class_id', None) == 56]
+        desks = [o for o in objects if getattr(o, 'class_id', None) == 60]
 
-        # Build chair analysis list for compatibility with existing frontend
+        # Filter overlapping chair detections (e.g., double boxes on the same chair)
+        chairs = []
+        for c in chairs_raw:
+            overlap = False
+            for existing in chairs:
+                if np.hypot(c.center[0] - existing.center[0], c.center[1] - existing.center[1]) < 40:
+                    overlap = True
+                    break
+            if not overlap:
+                chairs.append(c)
+
+        # Sort chairs: Right row first, then Left row. Within row: Front (bottom, max y) to Back (top, min y).
+        n_right = 0
+        midpoint = 0.0
+
+        if chairs:
+            min_x = min(c.center[0] for c in chairs)
+            max_x = max(c.center[0] for c in chairs)
+            midpoint = (min_x + max_x) / 2.0
+
+            right_chairs = [c for c in chairs if c.center[0] > midpoint]
+            left_chairs = [c for c in chairs if c.center[0] <= midpoint]
+
+            right_chairs.sort(key=lambda c: c.center[1], reverse=True)
+            left_chairs.sort(key=lambda c: c.center[1], reverse=True)
+
+            chairs = right_chairs + left_chairs
+            n_right = len(right_chairs)
+
+        total_chairs = len(chairs)
+
+        scene_features = self._build_scene_features(image, chairs, desks)
+        scene_classification, scene_confidence = self._classify_scene(scene_features)
+
+        # Dynamic threshold based on scene classification
+        # If the scene is overall correct, we need a huge deviation to flag a chair.
+        # If it's misplaced, we use a tighter threshold to catch the offending chairs.
+        aisle_threshold = 50 if scene_classification == "misplaced_arrangement" else 300
+
+        # Robust edge-anchored regression to detect pulled-out chairs
+        pulled_out_set = set()  # indices (0-based) of chairs flagged as pulled out
+        if total_chairs >= 4:
+            for col_chairs, col_start in [
+                (chairs[:n_right], 0),
+                (chairs[n_right:], n_right)
+            ]:
+                if len(col_chairs) < 3:
+                    continue
+
+                xs = np.array([c.center[0] for c in col_chairs], dtype=float)
+                ys = np.array([c.center[1] for c in col_chairs], dtype=float)
+
+                # Step 1: Fit initial line to all chairs to capture the general slant
+                coeffs_init = np.polyfit(ys, xs, 1)
+                pred_x_init = np.polyval(coeffs_init, ys)
+
+                # Step 2: Compute deviations (both columns face left, walkway is to the right = larger X)
+                devs = xs - pred_x_init
+
+                # Step 3: Select tucked-in chairs (smallest deviations)
+                tucked_in_indices = np.argsort(devs)[:3]
+                edge_chairs = [col_chairs[idx] for idx in tucked_in_indices]
+                edge_xs = np.array([c.center[0] for c in edge_chairs], dtype=float)
+                edge_ys = np.array([c.center[1] for c in edge_chairs], dtype=float)
+
+                y_spread = np.max(edge_ys) - np.min(edge_ys) if len(edge_ys) > 0 else 0
+
+                if y_spread < 50 or len(edge_chairs) < 2:
+                    # Not enough vertical spread to fit a reliable line, use vertical median
+                    median_x = float(np.median(edge_xs))
+                    coeffs = np.array([0.0, median_x])
+                else:
+                    coeffs = np.polyfit(edge_ys, edge_xs, 1)
+
+                # Evaluate all chairs in the column against the robust edge line
+                for j, c in enumerate(col_chairs):
+                    pred_x = np.polyval(coeffs, c.center[1])
+                    aisle_res = c.center[0] - pred_x
+                        
+                    # If chair is beyond threshold into the aisle relative to the edge anchor line, flag it
+                    if aisle_res > aisle_threshold:
+                        pulled_out_set.add(col_start + j)
+
         chair_analyses = []
-        
-        # Add properly placed chairs
-        misplaced_numbers = set()
-        for mc in misplaced_list:
-            if isinstance(mc, dict):
-                misplaced_numbers.add(mc.get("chair_number", 0))
-        
-        for i in range(1, total_chairs + 1):
-            is_misplaced = i in misplaced_numbers
+
+        for i, chair in enumerate(chairs, start=1):
+            nearest_desk, distance_to_desk, overlap_ratio = self._find_nearest_desk(chair, desks)
             issues = []
-            if is_misplaced:
-                # Find the matching misplaced entry
-                for mc in misplaced_list:
-                    if isinstance(mc, dict) and mc.get("chair_number") == i:
-                        issue = mc.get("issue", "misplaced")
-                        position = mc.get("position", "")
-                        if position:
-                            issues.append(f"{issue} ({position})")
-                        else:
-                            issues.append(issue)
-                        break
-            
+            properly_arranged = True
+
+            # Per-chair classification: use the pre-computed regression outlier set
+            if (i - 1) in pulled_out_set:
+                issues.append("Pulled out")
+                properly_arranged = False
+
+            # Alignment score
+            alignment_score = 100.0
+            if "Pulled out" in issues:
+                alignment_score -= 35.0
+            alignment_score = max(0.0, min(100.0, alignment_score))
+
+            is_dist_invalid = distance_to_desk == float('inf') or np.isinf(distance_to_desk) or np.isnan(distance_to_desk)
             chair_analyses.append(ChairAnalysis(
                 chair_id=i,
-                bbox=(0, 0, 0, 0),
-                center=(0, 0),
-                confidence=0.9,
-                is_properly_arranged=not is_misplaced,
-                nearest_desk_id=None,
-                distance_to_desk=None,
-                alignment_score=35.0 if is_misplaced else 95.0,
+                bbox=getattr(chair, 'bbox', (0, 0, 0, 0)),
+                center=getattr(chair, 'center', (0, 0)),
+                confidence=self._safe_float(getattr(chair, 'confidence', 0.0)),
+                is_properly_arranged=properly_arranged,
+                nearest_desk_id=getattr(nearest_desk, 'class_id', None),
+                distance_to_desk=None if is_dist_invalid else float(distance_to_desk),
+                alignment_score=alignment_score,
                 issues=issues
             ))
 
-        accuracy = (properly_placed / max(total_chairs, 1)) * 100.0
-        logger.info(
-            "AnalysisResult generated: provider=%s model=%s total_chairs=%d misplaced=%d accuracy=%.1f scene=%s",
-            self.provider,
-            self.model_name,
-            total_chairs,
-            misplaced_count,
-            round(accuracy, 1),
-            scene_class
-        )
+        misplaced = len([c for c in chair_analyses if not c.is_properly_arranged])
+        avg_confidence = self._safe_float(float(np.mean([c.confidence for c in chair_analyses]))) if chair_analyses else 0.0
 
         return AnalysisResult(
             total_chairs=total_chairs,
-            total_desks=0,
-            correct_chairs=properly_placed,
-            misplaced_chairs=misplaced_count,
-            accuracy=round(accuracy, 1),
-            avg_confidence=90.0,
+            total_desks=len(desks),
+            correct_chairs=total_chairs - misplaced,
+            misplaced_chairs=misplaced,
+            accuracy=self._safe_float(100.0 * (total_chairs - misplaced) / total_chairs) if total_chairs > 0 else 0.0,
+            avg_confidence=self._safe_float(avg_confidence),
             chairs=[asdict(c) for c in chair_analyses],
-            desks=[],
-            image_width=w,
-            image_height=h,
-            scene_classification=scene_class,
-            scene_confidence=scene_confidence,
-            ai_description=summary,
-            ai_provider=used_provider,
-            ai_model=self.hf_model_name if used_provider == "huggingface" else self.groq_model_name
+            desks=[{'bbox': getattr(d, 'bbox', (0,0,0,0)), 'center': getattr(d, 'center', (0,0)), 'confidence': self._safe_float(getattr(d, 'confidence', 0.0))} for d in desks],
+            image_width=int(image.shape[1]) if image is not None else 0,
+            image_height=int(image.shape[0]) if image is not None else 0,
+            scene_classification=scene_classification,
+            scene_confidence=self._safe_float(scene_confidence),
+            ai_description=f"ML model detected {total_chairs} chair(s) and flagged {misplaced} as misplaced (pulled out or tilted).",
+            ai_provider='local_yolo',
+            ai_model=os.path.basename(self.local_model_path or 'yolov8n.pt')
         )
+
+    def _build_scene_features(self, image: np.ndarray, chairs: List[Any], desks: List[Any]) -> Dict[str, float]:
+        h, w = image.shape[:2]
+        img_area = h * w
+        img_diagonal = np.sqrt(w**2 + h**2)
+
+        chair_positions_x = [c.center[0] / w for c in chairs] if chairs else [0.0]
+        chair_positions_y = [c.center[1] / h for c in chairs] if chairs else [0.0]
+        chair_aspect_ratios = [c.height / max(c.width, 1) for c in chairs] if chairs else [0.0]
+
+        spacings = []
+        if len(chairs) >= 2:
+            sorted_chairs = sorted(chairs, key=lambda c: c.center[1])
+            for i in range(1, len(sorted_chairs)):
+                dx = sorted_chairs[i].center[0] - sorted_chairs[i-1].center[0]
+                dy = sorted_chairs[i].center[1] - sorted_chairs[i-1].center[1]
+                spacings.append(np.sqrt(dx*dx + dy*dy) / img_diagonal)
+
+        # Column analysis
+        max_col_dev = 0.0
+        aisle_ratio = 0.0
+        if len(chairs) >= 2:
+            min_cx = min(c.center[0] for c in chairs)
+            max_cx = max(c.center[0] for c in chairs)
+            mid_cx = (min_cx + max_cx) / 2.0
+            col_sep = max(max_cx - min_cx, 1.0)
+
+            right = [c for c in chairs if c.center[0] > mid_cx]
+            left = [c for c in chairs if c.center[0] <= mid_cx]
+
+            x_devs = []
+            if len(right) >= 2:
+                r_med = float(np.median([c.center[0] for c in right]))
+                for c in right:
+                    x_devs.append(max(0, c.center[0] - r_med) / col_sep)
+            if len(left) >= 2:
+                l_med = float(np.median([c.center[0] for c in left]))
+                for c in left:
+                    x_devs.append(max(0, c.center[0] - l_med) / col_sep)
+
+            if x_devs:
+                max_col_dev = float(max(x_devs))
+                aisle_ratio = float(sum(1 for d in x_devs if d > 0.08) / len(chairs))
+
+        # Visual features
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+        lower_floor = np.array([0, 0, 150])
+        upper_floor = np.array([180, 60, 255])
+        floor_mask = cv2.inRange(hsv, lower_floor, upper_floor)
+        lower_half = floor_mask[h//2:, :]
+        floor_exposure = float(np.sum(lower_half > 0) / max(lower_half.size, 1))
+
+        edges = cv2.Canny(gray, 50, 150)
+        edge_density = float(np.sum(edges[h//2:, :] > 0) / max(edges[h//2:, :].size, 1))
+
+        lower_blue = np.array([90, 40, 80])
+        upper_blue = np.array([130, 255, 255])
+        blue_mask = cv2.inRange(hsv, lower_blue, upper_blue)
+        blue_exposure = float(np.sum(blue_mask > 0) / max(blue_mask.size, 1))
+
+        # Chair coverage
+        total_area = sum(c.width * c.height for c in chairs) if chairs else 0
+        chair_coverage = float(total_area / img_area) if chairs else 0.0
+
+        return {
+            "aisle_chair_ratio": aisle_ratio,
+            "aspect_variance": float(np.var(chair_aspect_ratios)) if len(chair_aspect_ratios) > 1 else 0.0,
+            "avg_aspect_ratio": float(np.mean(chair_aspect_ratios)) if chair_aspect_ratios else 0.0,
+            "avg_spacing": float(np.mean(spacings)) if spacings else 0.0,
+            "blue_desk_exposure": blue_exposure,
+            "chair_coverage_ratio": chair_coverage,
+            "edge_density": edge_density,
+            "floor_exposure": floor_exposure,
+            "max_column_x_deviation": max_col_dev,
+            "std_chair_x": float(np.std(chair_positions_x)) if len(chair_positions_x) > 1 else 0.0,
+            "std_chair_y": float(np.std(chair_positions_y)) if len(chair_positions_y) > 1 else 0.0,
+            "std_spacing": float(np.std(spacings)) if len(spacings) > 1 else 0.0,
+            "x_variance": float(np.var(chair_positions_x)) if len(chair_positions_x) > 1 else 0.0,
+            "y_variance": float(np.var(chair_positions_y)) if len(chair_positions_y) > 1 else 0.0,
+        }
+
+    def _estimate_tilt_angle(self, obj: Any, image: np.ndarray) -> float:
+        x1, y1, x2, y2 = obj.bbox
+        roi = image[max(0, y1):min(image.shape[0], y2), max(0, x1):min(image.shape[1], x2)]
+        if roi.size == 0:
+            return 0.0
+
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(blur, 50, 150)
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return 0.0
+
+        largest = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(largest) < 50:
+            return 0.0
+
+        rect = cv2.minAreaRect(largest)
+        angle = rect[-1]
+        if rect[1][0] < rect[1][1]:
+            angle = 90.0 + angle
+        angle = abs(angle)
+        if angle > 90.0:
+            angle = 180.0 - angle
+        return angle
+
+    def _is_chair_pulled_out_of_row(self, obj: Any, chairs: List[Any]) -> bool:
+        x_positions = [c.center[0] for c in chairs]
+        if len(x_positions) < 2:
+            return False
+        avg_x = sum(x_positions) / len(x_positions)
+        return abs(obj.center[0] - avg_x) > max(1.0, np.std(x_positions) * 2.0)
+
+    def analyze_arrangement(self, image: np.ndarray) -> AnalysisResult:
+        """Full analysis pipeline using local YOLO detection."""
+        h, w = image.shape[:2]
+
+        if not self.has_local_fallback():
+            logger.error("Local YOLO model not available for analysis.")
+            return AnalysisResult(
+                total_chairs=0, total_desks=0, correct_chairs=0, misplaced_chairs=0,
+                accuracy=0.0, avg_confidence=0.0, chairs=[], desks=[],
+                image_width=w, image_height=h, scene_classification="local_model_missing",
+                ai_provider="local_yolo",
+                ai_model="none"
+            )
+
+        result = self._local_fallback_analysis(image)
+        logger.info(
+            "AnalysisResult generated: provider=%s model=%s total_chairs=%d misplaced=%d accuracy=%.1f scene=%s",
+            result.ai_provider,
+            result.ai_model,
+            result.total_chairs,
+            result.misplaced_chairs,
+            result.accuracy,
+            result.scene_classification
+        )
+        return result
 
     def annotate_image(self, image: np.ndarray, result: AnalysisResult) -> np.ndarray:
         """
@@ -492,7 +602,7 @@ class ChairAnalyzer:
         lines = []
         lines.append(f"Total Chairs: {result.total_chairs}")
         lines.append(f"Properly Arranged: {result.correct_chairs}  |  Misplaced: {result.misplaced_chairs}")
-        
+
         if result.accuracy >= 80:
             acc_text = f"Arrangement Accuracy: {result.accuracy}%"
         else:
@@ -524,7 +634,7 @@ class ChairAnalyzer:
         cv2.putText(annotated, acc_text, (10, y_pos), font, 0.72, acc_color, 2)
         y_pos += 24
 
-        cv2.putText(annotated, "AI: Groq (Llama 4 Scout Vision)", (10, y_pos), font, 0.42, (160, 160, 160), 1)
+        cv2.putText(annotated, "ML: Local YOLO detection", (10, y_pos), font, 0.42, (160, 160, 160), 1)
         y_pos += 20
 
         # Draw misplaced chair details

@@ -25,9 +25,11 @@ logging.basicConfig(
 logger = logging.getLogger("backend")
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend.services.database import init_db, create_analysis, update_analysis_results, \
     update_analysis_status, update_report_path, get_analysis, delete_analysis, delete_all_analyses, get_analyses, get_dashboard_stats
@@ -50,13 +52,23 @@ for d in [UPLOAD_DIR, RESULTS_DIR, REPORTS_DIR]:
 
 
 def _make_json_serializable(obj):
-    """Convert non-JSON-serializable objects like tuples to lists recursively."""
-    if isinstance(obj, tuple):
+    """Convert non-JSON-serializable objects like tuples to lists recursively, and sanitize NaNs."""
+    import math
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    elif isinstance(obj, tuple):
         return list(obj)
     elif isinstance(obj, dict):
         return {k: _make_json_serializable(v) for k, v in obj.items()}
     elif isinstance(obj, list):
         return [_make_json_serializable(item) for item in obj]
+    elif hasattr(obj, 'item') and callable(getattr(obj, 'item')): # handle numpy scalars
+        val = obj.item()
+        if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+            return None
+        return val
     return obj
 
 
@@ -70,9 +82,9 @@ async def lifespan(app: FastAPI):
     # Initialize the AI analyzer
     analyzer = get_analyzer()
     if analyzer.is_ready:
-        logger.info("✅ AI provider loaded: %s (%s)", analyzer.provider, analyzer.model_name)
+        logger.info("✅ Local analyzer loaded: %s", analyzer.model_name)
     else:
-        logger.warning("⚠️ AI provider failed to load — detection will not work")
+        logger.warning("⚠️ Local analyzer failed to load — detection will not work")
     logger.info("🟢 System ready!")
     yield
     # Shutdown
@@ -83,7 +95,8 @@ app = FastAPI(
     title="Smart Lab Chair Monitoring System",
     description="AI-powered chair arrangement detection and analysis",
     version="1.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
+    debug=False
 )
 
 # CORS for development
@@ -94,6 +107,31 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"success": False, "detail": exc.detail},
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=422,
+        content={"success": False, "detail": exc.errors()},
+    )
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request, exc):
+    logger.exception("Unhandled exception: %s", exc)
+    return JSONResponse(
+        status_code=500,
+        content={"success": False, "detail": "Internal server error"},
+    )
 
 
 # ---------- API ENDPOINTS ----------
@@ -159,7 +197,7 @@ async def upload_image(
 @app.post("/api/analyze/{analysis_id}")
 async def analyze_image(analysis_id: str):
     """
-    Run AI analysis on a previously uploaded image.
+    Run ML model analysis on a previously uploaded image.
     Detects chairs and desks, evaluates arrangement, and generates annotated output.
     """
     # Get the analysis record
@@ -190,7 +228,7 @@ async def analyze_image(analysis_id: str):
             with open(test_data_path, 'r') as f:
                 test_data = json.load(f)
         
-        # Run AI analysis
+        # Run ML model analysis
         analyzer = get_analyzer()
         start_time = time.perf_counter()
         
@@ -225,7 +263,7 @@ async def analyze_image(analysis_id: str):
         
         elapsed_ms = (time.perf_counter() - start_time) * 1000.0
         logger.info(
-            "AI analysis completed: analysis_id=%s provider=%s model=%s total_chairs=%d misplaced=%d correct=%d accuracy=%.1f scene=%s duration_ms=%.1f summary=%s",
+            "ML model analysis completed: analysis_id=%s provider=%s model=%s total_chairs=%d misplaced=%d correct=%d accuracy=%.1f scene=%s duration_ms=%.1f summary=%s",
             analysis_id,
             result.ai_provider,
             result.ai_model or analyzer.model_name or "unknown",
@@ -238,12 +276,10 @@ async def analyze_image(analysis_id: str):
             repr(result.ai_description[:180].replace("\n", " "))
         )
 
-        if result.scene_classification == "invalid_api_key":
-            raise HTTPException(status_code=400, detail="AI provider API key is invalid or missing. Please check your .env file.")
-        elif result.scene_classification == "quota_exhausted":
-            raise HTTPException(status_code=429, detail="AI provider quota exhausted. Please wait or upgrade your plan.")
-        elif result.scene_classification == "error":
-            raise HTTPException(status_code=500, detail="AI provider encountered an error.")
+        if result.scene_classification == "error":
+            raise HTTPException(status_code=500, detail="Analysis provider encountered an error.")
+        elif result.scene_classification == "local_model_missing":
+            raise HTTPException(status_code=500, detail="Local YOLO model is missing or cannot be loaded.")
 
         # Generate annotated image
         annotated = analyzer.annotate_image(image, result)
@@ -423,10 +459,10 @@ async def clear_history():
 async def dashboard_stats():
     """Get aggregate dashboard statistics."""
     stats = await get_dashboard_stats()
-    return {
+    return _make_json_serializable({
         "success": True,
         "data": stats
-    }
+    })
 
 
 @app.get("/api/images/uploads/{filename}")
@@ -456,7 +492,7 @@ def _format_analysis_response(record: dict) -> dict:
     has_result = record.get("result_path") and os.path.exists(record.get("result_path", ""))
     has_heatmap = os.path.exists(os.path.join(RESULTS_DIR, f"heatmap_{analysis_id}.jpg"))
 
-    return {
+    res = {
         "id": analysis_id,
         "original_filename": record.get("original_filename"),
         "status": record.get("status"),
@@ -477,6 +513,7 @@ def _format_analysis_response(record: dict) -> dict:
         "details": record.get("details"),
         "ai_description": record.get("details", {}).get("ai_description", "") if record.get("details") else "",
     }
+    return _make_json_serializable(res)
 
 
 # ---------- STATIC FILES (Frontend) ----------
@@ -490,4 +527,4 @@ if os.path.exists(FRONTEND_DIR):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("backend.app:app", host="0.0.0.0", port=8000, reload=True)

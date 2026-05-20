@@ -78,7 +78,7 @@ class ImageProcessor:
     def enhance_edges(image: np.ndarray) -> np.ndarray:
         """
         Apply unsharp masking for edge enhancement.
-        This helps the AI model detect chair/desk boundaries more clearly.
+        This helps the ML model detect chair/desk boundaries more clearly.
         """
         gaussian = cv2.GaussianBlur(image, (0, 0), sigmaX=3)
         sharpened = cv2.addWeighted(image, 1.5, gaussian, -0.5, 0)

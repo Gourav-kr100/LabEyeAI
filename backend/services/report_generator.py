@@ -198,7 +198,7 @@ def generate_pdf_report(
 
     # --- Annotated Result Image ---
     if result_image_path and os.path.exists(result_image_path):
-        elements.append(Paragraph("🔍 AI Analysis Result", heading_style))
+        elements.append(Paragraph("🔍 ML Model Analysis Result", heading_style))
         try:
             img = RLImage(result_image_path)
             img_width = min(170 * mm, img.drawWidth)
